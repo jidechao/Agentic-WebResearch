@@ -386,7 +386,7 @@ save_report(run_id, report)
 ### 安装
 
 ```bash
-cd PlanExecute-ReAct
+cd Agentic-WebResearch
 python -m venv .venv
 
 # 激活（Windows PowerShell）
@@ -495,7 +495,7 @@ DAG 计划：
 ## 项目结构
 
 ```
-PlanExecute-ReAct/
+Agentic-WebResearch/
 ├── repl.py                      # CLI REPL 入口
 ├── requirements.txt
 ├── .env                         # 密钥与模型配置（不入库）

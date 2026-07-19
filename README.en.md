@@ -390,7 +390,7 @@ These are the principles hardened over the project's evolution. Please understan
 ### Install
 
 ```bash
-cd PlanExecute-ReAct
+cd Agentic-WebResearch
 python -m venv .venv
 
 # Activate (Windows PowerShell)
@@ -500,7 +500,7 @@ in `.env`. See [ADR-0008](docs/adr/0008-external-config-toml.md).
 ## Project Structure
 
 ```
-PlanExecute-ReAct/
+Agentic-WebResearch/
 ├── repl.py                      # CLI REPL entry
 ├── requirements.txt
 ├── .env                         # Keys & model config (not committed)
