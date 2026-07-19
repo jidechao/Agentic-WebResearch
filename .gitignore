@@ -1,0 +1,51 @@
+# ---- Secrets (NEVER commit) ----
+.env
+.env.*
+!.env.example
+
+# ---- Local behavioral config (user copy of config.example.toml) ----
+config.toml
+
+# ---- Tooling state & stray local artifacts (not for repo) ----
+.omc/
+.memsearch/
+.claude/
+/test.txt
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+
+# ---- Runtime artifacts (auto-generated per run) ----
+runs/
+*.tmp
+*.log
+
+# ---- Local backups (project convention: backup-<timestamp>/) ----
+backup-*/
+
+# ---- IDE / Editor ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Local reference material (copyrighted third-party articles, not for public repo) ----
+*.mhtml

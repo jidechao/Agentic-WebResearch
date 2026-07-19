@@ -1,0 +1,33 @@
+# PlanExecute-ReAct 行为参数（停止条件 + 生成/上下文上限）
+#
+# 用法：复制本文件为 config.toml，按需改值；缺失的键自动回退到下方默认。
+# config.toml 不入库（已在 .gitignore）；本文件（example）随仓库走、是单一真相源。
+# 密钥与模型仍放 .env（见 .env.example）；本文件只管"行为"。
+#
+# 改完无需改任何源码。非法值会在启动时告警并回退到默认，不崩。
+
+[limits]                   # 循环迭代上限（智能体的"停止条件"）
+react_task_rounds = 6       # ReAct 顶层任务最大轮数（react.py）
+react_rounds      = 3       # 单个子任务的 ReAct 轮数（Plan-Execute 内层）
+plan_steps        = 8       # 线性引擎计划长度硬上限（/engine linear）
+dag_nodes         = 8       # DAG 节点数硬上限（防重规划/补研膨胀）
+reflect_retries   = 2       # 子任务反思打回的最大重执次数
+report_retries    = 1       # 报告级 Reviewer 重写（+必要时补研）次数
+
+[review]                   # 通过阈值 + 审查输入截断
+critic_pass_score   = 7      # Critic / 报告 Reviewer 评分 ≥ 此值放行（1-10）
+critic_result_chars = 2000   # 喂给 Critic 的 result 截断长度
+report_review_chars = 4000   # 喂给报告 Reviewer 的 report 截断长度
+
+[llm]                      # 模型调用
+retries           = 3        # 失败重试次数（指数退避 2**attempt 秒）
+timeout           = 120.0    # client 超时秒（防流式半开连接挂死）
+max_tokens        = 4096     # 默认生成长度上限
+report_max_tokens = 8192     # 报告生成长度上限（2000 字中文约 3000+ token）
+
+[search]                   # 联网搜索（博查）
+max_results          = 5         # 每次返回的网页条数
+timeout              = 30        # 博查 API 超时秒
+content_chars        = 500       # 单条结果摘要截断（防撑爆上下文）
+freshness            = "oneYear" # 时效限定；"noLimit" 覆盖更广
+upstream_brief_chars = 300       # 注入下游的上游结果摘要长度
