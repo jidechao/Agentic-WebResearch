@@ -50,6 +50,7 @@
 - **当前日期注入**：`llm._inject_date` 在每次 `chat`/`chat_stream` 把"当前日期：YYYY年M月D日（星期X）"注入 system 消息（已有则合并），防模型对"今天/今年/最新"幻觉（见 ADR-0007）。
 - **外部配置（config.toml）**：行为参数（停止条件 + 生成/上下文上限）从项目根 `config.toml` 覆盖，`config.example.toml` 是模板，`agent/config.py` 内置默认兜底；密钥与模型仍在 `.env`（见 ADR-0008）。
 - **web_search 工具**：博查联网搜索；`tools.web_search_tool` 是它的工具协议适配器。
+- **引用（Citation）**：报告标注证据来源的内联 [N] 标记 + 末尾参考列表；证据 ID（s1/s2/...）由 web_search 工具在解析博查结果时分配并写入全局证据池，URL/title 直取 API（零幻觉）；报告后处理把 [sN] 重映射为连续 [1]..[n] 并拼接参考列表（见 ADR-0009）。
 - **路由（Router）**：`agent/router.py`，问题类型理解 → 分发到 ReAct / Plan-Execute。
 
 ## 决策记录
@@ -59,4 +60,4 @@
 0005 原始需求直通车（executor/critic 对齐用户原文）、
 0006 报告级 Reviewer（双层反思下半层，重写 + 必要时补研）、
 0007 当前日期集中注入（LLM seam，防时效性幻觉）、
-0008 行为参数外部可配置化（config.toml，密钥与行为分离）。
+0008 行为参数外部可配置化（config.toml，密钥与行为分离）。 0009 引用事实源锚定搜索工具层（Citation：工具层分配 ID，URL 直取 API，零幻觉）。

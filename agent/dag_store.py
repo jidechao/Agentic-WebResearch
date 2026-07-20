@@ -106,6 +106,20 @@ def save_report(run_id: str, report: str) -> None:
     _atomic_write(os.path.join(run_dir(run_id), "report.md"), report)
 
 
+# ---------------------------------------------------------------- evidence
+def save_evidence(run_id: str, pool: list[dict]) -> None:
+    """落盘证据池（DAG 引擎 /resume 恢复用），与 plan/state 同目录同原子写模式。"""
+    _atomic_write(
+        os.path.join(run_dir(run_id), "evidence.json"),
+        json.dumps(pool, ensure_ascii=False, indent=2),
+    )
+
+
+def load_evidence(run_id: str) -> list[dict] | None:
+    """读回证据池；不存在或损坏返回 None（调用方据此走全新 reset）。"""
+    return _read_json(os.path.join(run_dir(run_id), "evidence.json"))
+
+
 def has_state(run_id: str) -> bool:
     return os.path.exists(os.path.join(run_dir(run_id), "state.json"))
 

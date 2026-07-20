@@ -13,6 +13,7 @@ Orchestrator（编排）：DAG 引擎的主流程。
 import asyncio
 
 from . import config, dag_store
+from . import evidence
 from .execute_reflect import report_review, run_with_reflection
 from .llm import chat_stream
 from .parsing import plans_differ
@@ -139,8 +140,21 @@ def _finalize(task: str, completed: list[dict], run_id: str, stream: bool) -> st
             if new_nodes:
                 completed = asyncio.run(_run_dag_async(task, new_nodes, completed, run_id))
         feedback = f"问题：{verdict['issues']}\n建议：{verdict['suggestion']}"
+    # 反思循环结束后、落盘前执行一次引用后处理（P2 时机）：[sN]→连续[k]+参考列表。
+    # finalize 只按正文 [sN] 查池展开，参考列表 URL 由证据池唯一决定（P1 兑现承诺）。
+    report = evidence.finalize_report(report)
     if not stream:
         print(report)  # 流式已由 chat_stream echo；非流式补打整份报告
+    else:
+        # 流式下 chat_stream 已 echo 原始正文（含 [sN]），这里补打 finalize 后
+        # 生成的参考章节，让用户看到重映射的成品部分（不重复打整份正文）。
+        refs = evidence.references_section(report)
+        if refs:
+            print("\n" + refs)
+        else:
+            print("\n（本报告无引用标记，未生成参考列表）")
+    # 证据池随报告落盘：/resume 时回填，保证恢复后引用功能可用（用户故事 #9）。
+    dag_store.save_evidence(run_id, evidence.get_pool())
     dag_store.save_report(run_id, report)
     return report
 
@@ -158,6 +172,14 @@ def run_plan_dag(
     """
     if run_id is None:
         run_id = dag_store.make_run_id(task, "manual")
+
+    # 证据池生命周期：resume 走 load 回填（不 reset，counter 起点 len+1），
+    # 全新任务走 reset 清池（P3 reset 语义）。
+    if resume and dag_store.has_state(run_id):
+        loaded = dag_store.load_evidence(run_id)
+        evidence.reset_evidence(loaded=loaded)
+    else:
+        evidence.reset_evidence()
 
     completed: list[dict] = []
     resumed = False

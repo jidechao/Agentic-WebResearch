@@ -2,7 +2,7 @@
 
 **[简体中文](README.md) | [English](README.en.md)**
 
-> A **web research agent** that "thinks before it acts." It **dynamically routes** each question to one of two execution paths — lightweight think-and-search (ReAct), or plan-then-execute (Plan-Execute) — and by default runs a production-grade pipeline of **DAG layered concurrency + double-loop reflection + resumable plan persistence**. Fully streamed, CLI REPL, built on DeepSeek + Bocha web search.
+> A **web research agent** that "thinks before it acts." It **dynamically routes** each question to one of two execution paths — lightweight think-and-search (ReAct), or plan-then-execute (Plan-Execute) — and by default runs a production-grade pipeline of **DAG layered concurrency + double-loop reflection + resumable plan persistence**. Fully streamed, CLI REPL, built on DeepSeek + Bocha web search. The final report ships with **traceable citations** — inline `[N]` markers + a trailing reference list, with links sourced directly from the Bocha API by the search-tool layer (zero hallucination).
 
 This document is for developers who want to **understand the internals, extend, or contribute**. Beyond the quick start, the second half dissects every mechanism: routing, the DAG pipeline, double-loop reflection, resumable persistence, and the LLM call layer.
 
@@ -64,6 +64,7 @@ You type a question
                        ③ Replan: after each layer, adjust remaining plan using new findings
                        ④ Summarize: write a report, then a report-level Reviewer checks the
                                     whole thing (gaps trigger targeted research + rewrite)
+                       ⑤ Cite: before persisting, pin search results as [N] markers + a reference list
                        Everything persists to disk; interrupt with /resume to continue
 ```
 
@@ -91,7 +92,7 @@ Dependencies are **one-way and acyclic**: upper layers orchestrate, lower layers
                 (ReAct loop deep module)  pure graph logic)    report-level Reviewer)
                      │                                          │
    ┌─────────────────┴──────────────────────────────────────────┐
-   llm.py        tools.py        dag_store.py    parsing.py    prompts.py
+   llm.py        tools.py        evidence.py     dag_store.py    parsing.py    prompts.py
   (unified       (web_search     (atomic           (robust JSON    (shared
    Reply +       + tool adapter)  persistence       parsing /       prompts)
    lazy client)                   + resume)         semantic diff)
@@ -113,6 +114,7 @@ Dependencies are **one-way and acyclic**: upper layers orchestrate, lower layers
 | `agent/react_loop.py` | ReAct loop deep module (reused by 3 callers) | `react_loop` |
 | `agent/llm.py` | Unified Reply/ToolCall + chat/chat_stream (lazy client) | `chat`, `chat_stream`, `Reply`, `ToolCall` |
 | `agent/tools.py` | web_search + tool-protocol adapter | `web_search`, `web_search_tool`, `SEARCH_TOOL_SCHEMA` |
+| `agent/evidence.py` | Evidence pool (citation backend) | `add_evidence`, `finalize_report`, `reset_evidence`, `get_pool` |
 | `agent/dag_store.py` | Atomic persistence of plan/state/report + resume | `save_*`, `load_*`, `make_run_id` |
 | `agent/parsing.py` | Robust JSON parsing, plan normalization, semantic diff | `parse_json_object`, `parse_json_array`, `plans_differ` |
 | `agent/prompts.py` | Shared prompts (subtask system prompt / summary) | `SUBTASK_SYSTEM`, `summary_prompt` |
@@ -271,8 +273,8 @@ save_report(run_id, report)
 
 ### Stage 3: Output & persistence
 
-- ReAct path: prints `reply.content` directly to the user.
-- Plan-Execute: the final report is streamed **and** persisted to `runs/<run_id>/report.md`.
+- ReAct path: prints `reply.content` directly to the user; before returning, `evidence.finalize_report` remaps the runtime `[sN]` anchors to contiguous `[1]..[n]` display numbers and appends the reference list.
+- Plan-Execute: the final report is streamed **and** persisted to `runs/<run_id>/report.md`; before persist it also runs `finalize_report`, and the evidence pool is saved to `evidence.json` (DAG engine only, for /resume backfill).
 
 ---
 
@@ -314,13 +316,14 @@ The user's raw text `task` is **passed verbatim** into the executor's and critic
 
 ### 6. Plan persistence & resumable interruption (`dag_store.py`)
 
-Every run atomically writes a trio to `runs/<run_id>/` in real time:
+Every run atomically writes to `runs/<run_id>/` in real time:
 
 | File | Contents |
 |------|------|
 | `plan.json` | The current DAG plan (updated on replan) |
 | `state.json` | `{task, completed:[{id,subtask,result}], remaining:[nodes], layer}` |
-| `report.md` | The final report |
+| `report.md` | The final report (post-citation) |
+| `evidence.json` | Evidence pool (DAG engine only; /resume backfill) |
 
 - **Atomic writes**: write `.tmp` then `os.replace`; on Windows if the target file is locked, degrade to a direct write with a warning — never crash the main flow.
 - **`run_id` is stable across processes**: `md5(task)[:8] + timestamp`, **not built-in `hash()`** (which is randomized per process via `PYTHONHASHSEED`, making the same task hash differently across processes and unresumable).
@@ -360,6 +363,21 @@ Models often wrap "JSON only" output in ```json fences or add prose. `_extract_j
 | Atomic persistence | `.tmp` + `os.replace`; no half-JSON on crash |
 | REPL exception isolation | a single task's exception never ends the session |
 
+### 11. Citation (`evidence.py`, ADR-0009)
+
+The final report gains **structured citations**: inline `[N]` markers in the body + a trailing reference list `[k] [title](URL) · date`. The core decision — **the source of truth for citations is anchored at the search-tool layer, not self-reported by the LLM**:
+
+- **ID assigned at the tool layer**: when `web_search` parses the Bocha API response it calls `add_evidence(title, url, date)` to assign a globally-unique runtime ID `[sN]` and write it to the evidence pool; the model can only copy markers it has seen in ReAct messages and **cannot inject fabricated URLs** (hallucinated links are eliminated at the source).
+- **URL-normalization dedup**: before assigning, the URL is normalized (strip fragment, strip utm_ tracking params, lowercase host); the same URL counts once (no duplicate reference entries).
+- **Runtime ID vs display ID separation**: the `[sN]` the model sees throughout is globally unique but non-contiguous; before the report is persisted, `finalize_report` scans once and remaps them to contiguous `[1]..[n]` in order of first appearance, then appends the reference section.
+- **Phantom-citation deletion**: if the model annotates an `[sN]` absent from the pool (a hallucination), the post-processor deletes it from the body and never lists it — a bare claim is more honest than a fake anchor.
+- **Concurrency safety**: `add_evidence`'s "lookup dedup table → assign ID → write" is a check-then-set sequence wrapped in a module-level `threading.Lock` (the DAG engine runs same-layer subtasks via `asyncio.to_thread` calling `web_search` concurrently; the GIL only guarantees single-bytecode atomicity, the lock is what makes dedup hold).
+- **Timing**: `finalize_report` runs once **after the reflection loop ends entirely, before persist** — each review round sees the raw `[sN]` so the "evidence sufficiency" dimension can directly judge whether the model annotated citations (poor annotation triggers a rewrite); remapping every round would let the model continue from already-remapped text and corrupt the numbering.
+- **No-marker fallback**: if the model never annotates `[sN]`, the report has no reference list (honest degradation, no forced fabrication).
+- **Persistence**: the evidence pool is saved alongside the report to `runs/<run_id>/evidence.json`; on `/resume` the pool is backfilled and the counter starts at `len(loaded)+1`, so new IDs never collide with history.
+
+> The evidence pool is module-level global state read/written directly by `web_search`; the three task entry points (react/plan_execute/orchestrator) call `reset_evidence()` when a task begins — callers are unaware, and the ReAct-loop deep module's signature is unchanged.
+
 ---
 
 ## Design Principles (Why It's Written This Way)
@@ -376,6 +394,7 @@ These are the principles hardened over the project's evolution. Please understan
 8. **Strict YAGNI**: cut every speculative design (injectable-client factory, `Node` dataclass, a literal `Blackboard` class, over-abstraction) — see ADR-0003's "not adopted" list.
 9. **Fail-fast over silent degradation**: missing keys error immediately, not deferred to a 401 / empty search.
 10. **One-way acyclic dependencies**: upper layers orchestrate, lower layers provide, never the reverse.
+11. **Anchor citations at the tool layer**: evidence IDs are assigned when search results are parsed, and URLs come from the API rather than LLM self-report; the report post-processor only does mechanical remapping and cannot inject fabricated links (ADR-0009).
 
 ---
 
@@ -514,7 +533,8 @@ Agentic-WebResearch/
 │   ├── llm.py                   #   Unified Reply/ToolCall + chat/chat_stream (lazy client)
 │   ├── parsing.py               #   Robust JSON parsing (array/object, dedup, semantic diff)
 │   ├── prompts.py               #   Shared prompts (subtask system / summary)
-│   ├── tools.py                 #   web_search + tool adapter
+│   ├── tools.py                 #   web_search + tool adapter (assigns evidence IDs when parsing Bocha results)
+│   ├── evidence.py               #   Evidence pool (citation backend: dedup / ID assignment / report post-processing)
 │   ├── router.py                #   Question type → route
 │   ├── react_loop.py            #   ReAct loop deep module (reused by 3 paths)
 │   ├── react.py                 #   ReAct top-level path
@@ -522,9 +542,10 @@ Agentic-WebResearch/
 │   ├── planner.py               #   DAG planning/replan/gap-fill + topo/cycle-break pure logic
 │   ├── execute_reflect.py       #   Subtask execution + double-loop reflection (Critic + report Reviewer)
 │   ├── orchestrator.py          #   DAG engine orchestration + persistence/resume + report reflection loop
-│   └── dag_store.py             #   Atomic persistence of plan/state/report
+│   └── dag_store.py             #   Atomic persistence of plan/state/report/evidence
 │
 ├── test_dag_unit.py             # Offline tests (DAG logic / cycle detection / topo / reflection parsing / round-trip)
+├── test_evidence_unit.py         # Offline tests (evidence pool: URL dedup / ID increment / remapping / phantom deletion)
 ├── test_fixes_unit.py           # Offline tests (LLM fixes / passthrough / report_review / plan_missing)
 ├── test_planner_smoke.py        # Real-API smoke (planner connectivity + DAG planning, token-light)
 │
@@ -542,7 +563,8 @@ Agentic-WebResearch/
     └── <run_id>/
         ├── plan.json
         ├── state.json
-        └── report.md
+        ├── evidence.json            # Evidence pool (DAG engine only; /resume backfill)
+    └── report.md                 # Final report (with ## References section)
 ```
 
 ---
@@ -558,6 +580,9 @@ python test_fixes_unit.py
 
 # Real-API smoke (token-light, one planner call) — DeepSeek connectivity + DAG planning
 python test_planner_smoke.py
+
+# Offline — evidence pool: URL-normalization dedup / global ID increment + reset / remapping continuity / phantom deletion
+python test_evidence_unit.py
 ```
 
 For end-to-end verification, run real questions via `python repl.py`.
@@ -604,6 +629,7 @@ Every significant decision (including **rejected alternatives and why**) lives i
 | [0006](docs/adr/0006-report-level-reviewer.md) | Report-level Reviewer (lower half of double-loop reflection, rewrite + targeted research) |
 | [0007](docs/adr/0007-current-date-injection.md) | Centralized current-date injection (LLM seam, prevents time-sensitivity hallucination) |
 | [0008](docs/adr/0008-external-config-toml.md) | Externalized behavior config (config.toml; keys vs behavior separated) |
+| [0009](docs/adr/0009-citation-from-tool-layer.md) | Anchor citation sources at the search-tool layer (not LLM self-report) |
 
 New domain terms are registered in the [`CONTEXT.md`](CONTEXT.md) glossary.
 

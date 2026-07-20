@@ -2,7 +2,7 @@
 
 **[简体中文](README.md) | [English](README.en.md)**
 
-> 一个会"先想清楚再动手"的**联网调研智能体**。根据问题类型**动态路由**到两条执行路径——简单的边想边查（ReAct），复杂的先规划再执行（Plan-Execute）——并默认走 **DAG 分层并发 + 双层反思 + 计划落盘可恢复** 的生产级流程。全程流式，CLI REPL，基于 DeepSeek + 博查联网搜索。
+> 一个会"先想清楚再动手"的**联网调研智能体**。根据问题类型**动态路由**到两条执行路径——简单的边想边查（ReAct），复杂的先规划再执行（Plan-Execute）——并默认走 **DAG 分层并发 + 双层反思 + 计划落盘可恢复** 的生产级流程。全程流式，CLI REPL，基于 DeepSeek + 博查联网搜索。最终报告自带**可溯源引用**——正文内联 `[N]` 编号 + 末尾参考列表，链接由搜索工具层从博查 API 直取（零幻觉）。
 
 本文档面向**想读懂内部原理、二次开发或贡献代码**的开发者。除"快速上手"外，后半部分逐层剖析了路由、DAG 流水线、双层反思、落盘恢复、LLM 调用层等全部机制。
 
@@ -61,6 +61,7 @@
                        ② 执行：按依赖分层，同层并发；每步产出由 Critic 把关，不达标重做
                        ③ 重规划：每层后据新信息调整剩余计划
                        ④ 汇总：写成报告，再由报告级 Reviewer 整体复核（漏了就补研重写）
+                       ⑤ 引用：报告落盘前自动把搜索结果锚定为 [N] 编号 + 末尾参考列表
                        全程落盘，中断可 /resume 续跑
 ```
 
@@ -88,7 +89,7 @@
                 (ReAct 循环深模块)        纯逻辑)           报告级 Reviewer)
                      │                                          │
    ┌─────────────────┴──────────────────────────────────────────┐
-   llm.py        tools.py        dag_store.py    parsing.py    prompts.py
+   llm.py        tools.py        evidence.py     dag_store.py    parsing.py    prompts.py
   (统一 Reply    (web_search     (计划/状态      (健壮 JSON     (共享
    + 懒构造      + 工具适配器)     落盘/恢复)      解析/去重)      prompt)
    client)                                                        │
@@ -110,6 +111,7 @@
 | `agent/react_loop.py` | ReAct 循环深模块（三处复用） | `react_loop` |
 | `agent/llm.py` | 统一 Reply/ToolCall + chat/chat_stream（懒构造 client） | `chat`, `chat_stream`, `Reply`, `ToolCall` |
 | `agent/tools.py` | web_search + 工具协议适配器 | `web_search`, `web_search_tool`, `SEARCH_TOOL_SCHEMA` |
+| `agent/evidence.py` | 证据池（引用溯源后端） | `add_evidence`, `finalize_report`, `reset_evidence`, `get_pool` |
 | `agent/dag_store.py` | 计划/状态/报告原子落盘与恢复 | `save_*`, `load_*`, `make_run_id` |
 | `agent/parsing.py` | 健壮 JSON 解析、计划归一化、语义比较 | `parse_json_object`, `parse_json_array`, `plans_differ` |
 | `agent/prompts.py` | 共享 prompt（子任务系统提示 / 汇总报告） | `SUBTASK_SYSTEM`, `summary_prompt` |
@@ -267,8 +269,8 @@ save_report(run_id, report)
 
 ### 阶段 3：产出与落盘
 
-- ReAct 路径：直接把 `reply.content` 打给用户。
-- Plan-Execute：最终报告流式打印 **并** 落盘到 `runs/<run_id>/report.md`。
+- ReAct 路径：直接把 `reply.content` 打给用户；返回前经 `evidence.finalize_report` 把运行期 `[sN]` 锚点重映射为连续 `[1]..[n]` 展示编号并拼接参考列表。
+- Plan-Execute：最终报告流式打印 **并** 落盘到 `runs/<run_id>/report.md`；落盘前同样经 `finalize_report` 后处理，并把证据池落盘 `evidence.json`（仅 DAG 引擎，供 /resume 回填）。
 
 ---
 
@@ -310,13 +312,14 @@ save_report(run_id, report)
 
 ### 6. 计划落盘与中断恢复（`dag_store.py`）
 
-每次 run 在 `runs/<run_id>/` 实时原子写入三件套：
+每次 run 在 `runs/<run_id>/` 实时原子写入：
 
 | 文件 | 内容 |
 |------|------|
 | `plan.json` | 当前 DAG 计划（replan 后更新） |
 | `state.json` | `{task, completed:[{id,subtask,result}], remaining:[节点], layer}` |
-| `report.md` | 最终报告 |
+| `report.md` | 最终报告（经引用后处理） |
+| `evidence.json` | 证据池（仅 DAG 引擎；/resume 回填） |
 
 - **原子写**：先写 `.tmp` 再 `os.replace`；Windows 上目标文件被占用时降级直写并警告，不中断主流程。
 - **`run_id` 跨进程稳定**：`md5(task)[:8] + 时间戳`，**不用内置 `hash()`**（后者每次进程启动随机化，同一任务跨进程哈希不同，无法恢复历史 run）。
@@ -356,6 +359,21 @@ save_report(run_id, report)
 | 原子落盘 | `.tmp` + `os.replace`，崩溃不留半个 JSON |
 | REPL 异常隔离 | 单任务异常不退出会话 |
 
+### 11. 引用溯源（Citation，`evidence.py`，ADR-0009）
+
+最终报告引入**结构化引用**：正文内联 `[N]` 编号 + 末尾参考列表 `[k] [标题](URL) · 日期`。核心决策——**引用事实源锚定在搜索工具层，而非让 LLM 自报**：
+
+- **ID 在工具层分配**：`web_search` 解析博查 API 返回时即调 `add_evidence(title, url, date)` 分配全局唯一运行期 ID `[sN]` 并写入证据池；模型在 ReAct 消息里只复制见过的标记，**无法注入自编 URL**（从源头杜绝幻觉链接）。
+- **URL 规范化去重**：分配前对 URL 去 fragment、去 utm_ 等 tracking 参数、host 小写；同 URL 只算一条（参考列表不重复）。
+- **运行期 ID vs 展示 ID 分离**：模型全程见的 `[sN]` 全局唯一但不连续；报告落盘前 `finalize_report` 单遍扫描，按首次出现顺序重映射为连续 `[1]..[n]`，并自动拼接参考章节。
+- **幻影引用删除**：模型若标注了池中不存在的 `[sN]`（幻觉），后处理直接从正文删除、不进参考列表——假锚点不如裸断言诚实。
+- **并发安全**：`add_evidence` 的"查去重表→分配 ID→写入"是 check-then-set 序列，用模块级 `threading.Lock` 包住（DAG 引擎同层子任务经 `asyncio.to_thread` 并发调 `web_search`，GIL 只保证单条字节码原子，锁才保证去重成立）。
+- **执行时机**：`finalize_report` 在反思循环**全部结束后、落盘前**执行一次——review 每轮看到的是原始 `[sN]`，"证据充分性"维度据此评判，标得差触发重写；若每轮重映射会导致模型基于已重映射文本续写、编号错乱。
+- **无标记兜底**：模型全程未标 `[sN]` → 报告无参考列表（诚实降级，不强制补造）。
+- **持久化**：证据池随报告落盘 `runs/<run_id>/evidence.json`；`/resume` 时回填池并把计数器起点设为 `len(loaded)+1`，保证恢复后新 ID 与历史不碰撞。
+
+> 证据池是模块级全局状态，`web_search` 直接读写，三个任务入口（react/plan_execute/orchestrator）在发起任务时 `reset_evidence()`——调用方无感知，ReAct 循环深模块签名零改动。
+
 ---
 
 ## 设计原则（为什么这么写）
@@ -372,6 +390,7 @@ save_report(run_id, report)
 8. **YAGNI 严格执行**：砍掉一切 speculative 设计（injectable client 工厂、`Node` dataclass、字面 `Blackboard` 类、过度抽象）——见 ADR-0003 的"未采纳项"。
 9. **fail-fast 优于静默降级**：密钥缺失即报错，不推迟成 401 / 空搜索。
 10. **依赖单向无环**：上层编排、下层供能，绝不反向。
+11. **引用锚定工具层**：证据 ID 在搜索结果解析时分配，URL 取自 API 而非 LLM 自报；报告后处理只做机械重映射，无法注入自编链接（ADR-0009）。
 
 ---
 
@@ -508,7 +527,8 @@ Agentic-WebResearch/
 │   ├── llm.py                   #   统一 Reply/ToolCall + chat/chat_stream（懒构造 client）
 │   ├── parsing.py               #   健壮 JSON 解析（数组/对象，去重，语义比较）
 │   ├── prompts.py               #   共享 prompt（子任务系统提示 / 汇总报告）
-│   ├── tools.py                 #   web_search + 工具适配器
+│   ├── tools.py                 #   web_search + 工具适配器（解析博查结果时分配证据 ID）
+│   ├── evidence.py               #   证据池（引用溯源后端：去重/ID 分配/报告后处理）
 │   ├── router.py                #   问题类型 → 路由
 │   ├── react_loop.py            #   ReAct 循环深模块（被三路径复用）
 │   ├── react.py                 #   ReAct 顶层路径
@@ -516,9 +536,10 @@ Agentic-WebResearch/
 │   ├── planner.py               #   DAG 规划/重规划/补研 + 拓扑/破环纯逻辑
 │   ├── execute_reflect.py       #   子任务执行 + 双层反思（Critic + 报告 Reviewer）
 │   ├── orchestrator.py          #   DAG 引擎编排 + 落盘/恢复 + 报告反思循环
-│   └── dag_store.py             #   计划/状态/报告原子持久化
+│   └── dag_store.py             #   计划/状态/报告/证据池原子持久化
 │
 ├── test_dag_unit.py             # 离线单测（DAG 逻辑 / 环检测 / 拓扑 / 反思解析 / 落盘重载）
+├── test_evidence_unit.py         # 离线单测（证据池：URL 去重 / ID 递增 / 重映射 / 幻影删除）
 ├── test_fixes_unit.py           # 离线单测（LLM 修复点 / passthrough / report_review / plan_missing）
 ├── test_planner_smoke.py        # 真实 API 冒烟（规划器连通 + DAG 规划，省 token）
 │
@@ -536,7 +557,8 @@ Agentic-WebResearch/
     └── <run_id>/
         ├── plan.json
         ├── state.json
-        └── report.md
+        ├── evidence.json            # 证据池（仅 DAG 引擎；/resume 回填）
+    └── report.md                 # 最终报告（含 ## 参考章节）
 ```
 
 ---
@@ -552,6 +574,9 @@ python test_fixes_unit.py
 
 # 真实 API 冒烟（省 token，只调一次规划器）—— DeepSeek 连通 + DAG 规划
 python test_planner_smoke.py
+
+# 离线单测 —— 证据池：URL 规范化去重 / ID 全局递增+reset / 重映射连续性 / 幻影引用删除
+python test_evidence_unit.py
 ```
 
 端到端验证直接 `python repl.py` 跑真实问题。
@@ -598,6 +623,7 @@ python test_planner_smoke.py
 | [0006](docs/adr/0006-report-level-reviewer.md) | 报告级 Reviewer（双层反思下半层，重写+必要时补研） |
 | [0007](docs/adr/0007-current-date-injection.md) | 当前日期集中注入（LLM seam 层，防时效性幻觉） |
 | [0008](docs/adr/0008-external-config-toml.md) | 行为参数外部可配置化（config.toml，密钥与行为分离） |
+| [0009](docs/adr/0009-citation-from-tool-layer.md) | 引用事实源锚定在搜索工具层（而非 LLM 自报） |
 
 新概念统一登记在 [`CONTEXT.md`](CONTEXT.md) 领域词汇表。
 

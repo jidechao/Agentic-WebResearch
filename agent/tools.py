@@ -8,6 +8,7 @@ import json
 import requests
 
 from . import config
+from . import evidence
 
 
 def web_search(query: str) -> str:
@@ -56,7 +57,10 @@ def web_search(query: str) -> str:
         if len(content) > config.SEARCH_CONTENT_LEN:
             content = content[: config.SEARCH_CONTENT_LEN] + "..."
         lines.append(
-            f"[{idx}] {title}\n"
+            # 锚定在工具层：解析博查返回时即调 add_evidence 分配运行期 ID [sN]，
+            # 模型在 ReAct 消息里只能复制见过的标记，无法注入自编 URL（ADR-0009）。
+            # title/url/date 直取 API（零幻觉），不存摘要正文（池只保留溯源必需字段）。
+            f"[{evidence.add_evidence(title=title, url=url, date=date[:10])}] {title}\n"
             f"    时间：{date[:10]}\n"
             f"    来源：{url}\n"
             f"    摘要：{content}"

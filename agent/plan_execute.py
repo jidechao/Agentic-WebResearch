@@ -11,6 +11,7 @@ Plan-Execute 路径：先出图纸，再照图施工 + 动态重规划。
 import json
 
 from . import config
+from . import evidence
 from .execute_reflect import report_review
 from .llm import chat, chat_stream
 from .parsing import normalize_plan, parse_json_array, plans_differ
@@ -105,6 +106,7 @@ def replan_if_needed(
 
 # ---------------------------------------------------------------- STEP 04 主流程
 def run_plan_and_execute(task: str, stream: bool = True) -> str:
+    evidence.reset_evidence()  # 新任务重置证据池（单 run 作用域）
     plan = make_plan(task)
     print("初始计划：")
     for index, item in enumerate(plan, start=1):
@@ -174,6 +176,16 @@ def run_plan_and_execute(task: str, stream: bool = True) -> str:
                     {"subtask": s, "result": execute_subtask(s, stream=stream, original_task=task)}
                 )
         feedback = f"问题：{verdict['issues']}\n建议：{verdict['suggestion']}"
+    # 反思循环结束后执行一次引用后处理（P2 时机）：[sN]→连续[k]+参考列表。
+    # 放在 print/return 前，保证非流式终端显示与返回值一致（含参考列表）。
+    report = evidence.finalize_report(report)
     if not stream:
         print(report)  # 流式已由 chat_stream echo；非流式补打整份报告
+    else:
+        # 流式下 chat_stream 已 echo 原始正文（含 [sN]），这里补打参考章节。
+        refs = evidence.references_section(report)
+        if refs:
+            print("\n" + refs)
+        else:
+            print("\n（本报告无引用标记，未生成参考列表）")
     return report
